@@ -276,7 +276,7 @@ button{font-family:'Jost',sans-serif;cursor:pointer;border:none;border-radius:va
 <footer style="position:fixed;bottom:0;left:0;right:0;z-index:100;display:flex;align-items:center;justify-content:center;gap:10px;padding:10px 24px;background:linear-gradient(to top,#faf8f4 75%,transparent);border-top:1px solid #ecdcb0;pointer-events:none">
   <span style="font-family:'DM Mono',monospace;font-size:11px;color:#b0976e;letter-spacing:0.08em">Schools Atlas Creator</span>
   <span style="width:3px;height:3px;border-radius:50%;background:#d4aa5a;display:inline-block;opacity:0.6"></span>
-  <span id="appVersion" style="font-family:'DM Mono',monospace;font-size:11px;color:#b8882a;letter-spacing:0.08em;font-weight:500">v2.0.4</span>
+  <span id="appVersion" style="font-family:'DM Mono',monospace;font-size:11px;color:#b8882a;letter-spacing:0.08em;font-weight:500">v2.0.5</span>
 </footer>
 
 <script>
@@ -299,7 +299,7 @@ const MODEL_ITEM_ID    = 'de65f2db19034b28a503b136a7f6a80e';
 const VIEWER_BASE      = 'https://webapps.maps.arcgis.com/apps/instant/atlas/index.html';
 
 // ── Version ──
-const BASE_VERSION = 4;
+const BASE_VERSION = 5;
 function renderVersion(){ document.getElementById('appVersion').textContent = 'v2.0.' + BASE_VERSION; }
 renderVersion();
 
@@ -528,44 +528,35 @@ async function doDeploy(){
     // (group + title), and viewer URL.
     // ══════════════════════════════════════════════════════════════
 
-    log('info', 'Cloning working Atlas Instant App (' + MODEL_ITEM_ID + ')…');
+    log('info', 'Reading working Atlas Instant App (' + MODEL_ITEM_ID + ')…');
 
-    // ── Step 1: copyItem with ONLY itemId and token ──
-    // Passing any other params (title, folder, includeResources) on
-    // cross-org items causes ArcGIS to reject with "User folder does
-    // not exist". The minimal call always works; we customize after.
-    const copyRes = await agolPost('/content/users/' + STATE.username + '/copyItem', {
-      itemId: MODEL_ITEM_ID,
-      token:  STATE.token
-    });
-    const appItemId = copyRes.itemId || (copyRes.item && copyRes.item.id);
-    if(!appItemId) throw new Error('copyItem returned no item ID — response: ' + JSON.stringify(copyRes));
-    log('ok', '✓ Cloned Instant App created: ' + appItemId);
-
-    // ── Step 2: Fetch the model's data JSON so we can edit it ──
-    log('info', 'Loading cloned app configuration…');
-    let appData;
+    // ── Step 1: Fetch the model item's metadata and data ──
+    // copyItem fails cross-account with "User folder does not exist".
+    // Instead we manually read the model and recreate it via addItem.
+    let modelMeta, modelData;
     try {
-      appData = await agolFetch('/content/items/' + appItemId + '/data');
-      log('ok', '✓ Cloned configuration loaded.');
+      modelMeta = await agolFetch('/content/items/' + MODEL_ITEM_ID);
     } catch(e){
-      log('warn', '  Could not load cloned data: ' + e.message + ' — fetching from model instead.');
-      appData = await agolFetch('/content/items/' + MODEL_ITEM_ID + '/data');
+      throw new Error('Cannot read model item metadata: ' + e.message + '. Make sure item ' + MODEL_ITEM_ID + ' is publicly shared.');
     }
+    try {
+      modelData = await agolFetch('/content/items/' + MODEL_ITEM_ID + '/data');
+    } catch(e){
+      throw new Error('Cannot read model item data: ' + e.message);
+    }
+    log('ok', '✓ Model loaded — type: ' + modelMeta.type + ', typeKeywords: ' + (modelMeta.typeKeywords || []).length + ' keywords');
 
-    // ── Step 3: Apply user overrides to the data JSON ──
-    // ONLY change the fields the user explicitly customized.
-    // Everything else (signin, viewSwitch, save, theme, etc.) is
-    // preserved exactly as it is in the working model.
-    if(appData && appData.values){
-      appData.values.title       = appTitle;
-      appData.values.headerTitle = appTitle;
-      appData.values.group       = groupId;
-      appData.values.appid       = appItemId;
-      log('info', '  Overrides applied: title, headerTitle, group, appid');
+    // ── Step 2: Build the new item by replicating every relevant field ──
+    // Modify the data JSON in-memory to apply user overrides BEFORE creating
+    const cloneData = JSON.parse(JSON.stringify(modelData));
+    if(cloneData.values){
+      cloneData.values.title       = appTitle;
+      cloneData.values.headerTitle = appTitle;
+      cloneData.values.group       = groupId;
+      // appid will be patched in the post-create update
     }
-    if(appData && appData.configurationSettings){
-      appData.configurationSettings.forEach(function(section){
+    if(cloneData.configurationSettings){
+      cloneData.configurationSettings.forEach(function(section){
         (section.fields || []).forEach(function(field){
           if(field.fieldName === 'title')       field.value = appTitle;
           if(field.fieldName === 'headerTitle') field.value = appTitle;
@@ -574,18 +565,49 @@ async function doDeploy(){
       });
     }
 
-    // ── Step 4: Update the cloned item with user inputs ──
-    log('info', 'Updating clone with your title, tags, and group…');
+    // ── Step 3: Build addItem payload using the model's exact fields ──
+    const typeKwArray = Array.isArray(modelMeta.typeKeywords)
+      ? modelMeta.typeKeywords
+      : (typeof modelMeta.typeKeywords === 'string' ? modelMeta.typeKeywords.split(',') : []);
+
+    const payload = {
+      title:        appTitle,
+      type:         modelMeta.type,
+      typeKeywords: typeKwArray.join(','),
+      tags:         appTags,
+      snippet:      modelMeta.snippet || appTitle,
+      description:  modelMeta.description || ('Schools Atlas — ' + appTitle),
+      url:          VIEWER_BASE + '?appid=PLACEHOLDER',
+      text:         JSON.stringify(cloneData),
+      token:        STATE.token
+    };
+
+    // Copy over additional fields the configurator may validate against
+    if(modelMeta.accessInformation) payload.accessInformation = modelMeta.accessInformation;
+    if(modelMeta.licenseInfo)        payload.licenseInfo       = modelMeta.licenseInfo;
+    if(modelMeta.culture)            payload.culture           = modelMeta.culture;
+    if(modelMeta.extent)             payload.extent            = JSON.stringify(modelMeta.extent);
+    if(modelMeta.properties)         payload.properties        = JSON.stringify(modelMeta.properties);
+
+    log('info', '  Replicating fields: ' + Object.keys(payload).filter(function(k){return k!=='token'&&k!=='text';}).join(', '));
+    log('info', '  typeKeywords (' + typeKwArray.length + '): ' + typeKwArray.join(', '));
+
+    // ── Step 4: Create the new item ──
+    log('info', 'Creating Atlas Instant App in your account…');
+    const itemRes = await agolPost('/content/users/' + STATE.username + '/addItem', payload);
+    const appItemId = itemRes.id;
+    if(!appItemId) throw new Error('addItem returned no item ID — response: ' + JSON.stringify(itemRes));
+    log('ok', '✓ Instant App created: ' + appItemId);
+
+    // ── Step 5: Patch the URL with the real item ID and embed appid in data ──
+    log('info', 'Patching URL with new item ID…');
+    if(cloneData.values) cloneData.values.appid = appItemId;
     await agolPost('/content/users/' + STATE.username + '/items/' + appItemId + '/update', {
-      title:       appTitle,
-      tags:        appTags,
-      snippet:     appTitle,
-      description: 'Schools Atlas — ' + appTitle,
-      url:         VIEWER_BASE + '?appid=' + appItemId,
-      text:        JSON.stringify(appData),
-      token:       STATE.token
+      url:   VIEWER_BASE + '?appid=' + appItemId,
+      text:  JSON.stringify(cloneData),
+      token: STATE.token
     });
-    log('ok', '✓ Update applied to cloned app.');
+    log('ok', '✓ URL and appid finalized.');
 
     // ── Step 5: Verify the clone retained Instant App characteristics ──
     log('info', 'Verifying clone integrity…');
