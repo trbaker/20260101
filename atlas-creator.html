@@ -276,7 +276,7 @@ button{font-family:'Jost',sans-serif;cursor:pointer;border:none;border-radius:va
 <footer style="position:fixed;bottom:0;left:0;right:0;z-index:100;display:flex;align-items:center;justify-content:center;gap:10px;padding:10px 24px;background:linear-gradient(to top,#faf8f4 75%,transparent);border-top:1px solid #ecdcb0;pointer-events:none">
   <span style="font-family:'DM Mono',monospace;font-size:11px;color:#b0976e;letter-spacing:0.08em">Schools Atlas Creator</span>
   <span style="width:3px;height:3px;border-radius:50%;background:#d4aa5a;display:inline-block;opacity:0.6"></span>
-  <span id="appVersion" style="font-family:'DM Mono',monospace;font-size:11px;color:#b8882a;letter-spacing:0.08em;font-weight:500">v2.0.2</span>
+  <span id="appVersion" style="font-family:'DM Mono',monospace;font-size:11px;color:#b8882a;letter-spacing:0.08em;font-weight:500">v2.0.3</span>
 </footer>
 
 <script>
@@ -299,7 +299,7 @@ const MODEL_ITEM_ID    = 'de65f2db19034b28a503b136a7f6a80e';
 const VIEWER_BASE      = 'https://webapps.maps.arcgis.com/apps/instant/atlas/index.html';
 
 // ── Version ──
-const BASE_VERSION = 2;
+const BASE_VERSION = 3;
 function renderVersion(){ document.getElementById('appVersion').textContent = 'v2.0.' + BASE_VERSION; }
 renderVersion();
 
@@ -517,120 +517,89 @@ async function doDeploy(){
       groupId = await createCopyGroup(newGroupTitle, appTitle);
     }
 
-    // Fetch model item — both metadata AND data
-    log('info', 'Fetching working model item (' + MODEL_ITEM_ID + ')…');
-    let modelMeta = null, modelData = null;
-    try {
-      modelMeta = await agolFetch('/content/items/' + MODEL_ITEM_ID);
-      log('ok', '✓ Model metadata loaded — type: ' + modelMeta.type);
-    } catch(e){ log('warn', '  Model metadata fetch failed: ' + e.message); }
-    try {
-      modelData = await agolFetch('/content/items/' + MODEL_ITEM_ID + '/data');
-      log('ok', '✓ Model config loaded');
-    } catch(e){ log('warn', '  Model data fetch failed: ' + e.message); }
+    // ══════════════════════════════════════════════════════════════
+    // CLONE the working Atlas Instant App from the model item,
+    // then update only the fields the user customized.
+    //
+    // copyItem creates a full byte-for-byte duplicate including the
+    // exact typeKeywords, properties, data JSON shape, and any other
+    // internal fields the Esri configurator validates against.
+    // We then patch just the title, tags, description, app data
+    // (group + title), and viewer URL.
+    // ══════════════════════════════════════════════════════════════
 
-    if(!modelMeta){
-      throw new Error('Cannot create app — model item metadata could not be fetched. Check that you have access to item ' + MODEL_ITEM_ID);
+    log('info', 'Cloning working Atlas Instant App (' + MODEL_ITEM_ID + ')…');
+
+    // ── Step 1: copyItem creates an exact duplicate in the user's content ──
+    const copyRes = await agolPost('/content/users/' + STATE.username + '/copyItem', {
+      itemId:           MODEL_ITEM_ID,
+      title:            appTitle,            // sets the new item's title at copy time
+      includeResources: 'true',              // bring across thumbnail and resources
+      token:            STATE.token
+    });
+    const appItemId = copyRes.itemId || (copyRes.item && copyRes.item.id);
+    if(!appItemId) throw new Error('copyItem returned no item ID — response: ' + JSON.stringify(copyRes));
+    log('ok', '✓ Cloned Instant App created: ' + appItemId);
+
+    // ── Step 2: Fetch the model's data JSON so we can edit it ──
+    log('info', 'Loading cloned app configuration…');
+    let appData;
+    try {
+      appData = await agolFetch('/content/items/' + appItemId + '/data');
+      log('ok', '✓ Cloned configuration loaded.');
+    } catch(e){
+      log('warn', '  Could not load cloned data: ' + e.message + ' — fetching from model instead.');
+      appData = await agolFetch('/content/items/' + MODEL_ITEM_ID + '/data');
     }
 
-    // Build config from model + only the user's overrides
-    const atlasData = buildAtlasData(appTitle, groupId, null, modelData);
+    // ── Step 3: Apply user overrides to the data JSON ──
+    // ONLY change the fields the user explicitly customized.
+    // Everything else (signin, viewSwitch, save, theme, etc.) is
+    // preserved exactly as it is in the working model.
+    if(appData && appData.values){
+      appData.values.title       = appTitle;
+      appData.values.headerTitle = appTitle;
+      appData.values.group       = groupId;
+      appData.values.appid       = appItemId;
+      log('info', '  Overrides applied: title, headerTitle, group, appid');
+    }
+    if(appData && appData.configurationSettings){
+      appData.configurationSettings.forEach(function(section){
+        (section.fields || []).forEach(function(field){
+          if(field.fieldName === 'title')       field.value = appTitle;
+          if(field.fieldName === 'headerTitle') field.value = appTitle;
+          if(field.fieldName === 'group')       field.value = groupId;
+        });
+      });
+    }
 
-    // ── Build the addItem payload by copying EVERY non-system field
-    //    from the model's item description, then overriding only title,
-    //    tags, url, text, and properties. This guarantees we don't omit
-    //    any field the Esri configurator validates against.
-    const addItemPayload = {};
-
-    // 1. Copy every plain-value field from modelMeta (skip system fields
-    //    that the API computes or rejects: id, owner, created, modified,
-    //    size, numViews, etc.)
-    const SKIP_FIELDS = new Set([
-      'id','owner','orgId','ownerFolder','created','modified','guid',
-      'size','numViews','numComments','numRatings','avgRating',
-      'protected','itemControl','listed','commentsEnabled','culture',
-      'access','sharing','contentStatus','scoreCompleteness',
-      'groupDesignations','lastViewed'
-    ]);
-    Object.keys(modelMeta).forEach(function(key){
-      if(SKIP_FIELDS.has(key)) return;
-      const v = modelMeta[key];
-      if(v === null || v === undefined) return;
-      // Convert objects/arrays to JSON strings as REST API expects
-      if(typeof v === 'object'){
-        addItemPayload[key] = JSON.stringify(v);
-      } else {
-        addItemPayload[key] = v;
-      }
-    });
-
-    // 2. Apply user overrides (only these fields come from user input)
-    addItemPayload.title        = appTitle;
-    addItemPayload.tags         = appTags;
-    addItemPayload.snippet      = appTitle;
-    addItemPayload.description  = 'Schools Atlas — ' + appTitle;
-    addItemPayload.url          = VIEWER_BASE + '?appid=PLACEHOLDER';
-    addItemPayload.text         = JSON.stringify(atlasData);
-    addItemPayload.token        = STATE.token;
-
-    // Log which top-level fields we're sending so we can verify
-    log('info', '  Sending fields: ' + Object.keys(addItemPayload).filter(function(k){return k!=='token'&&k!=='text';}).join(', '));
-
-    // Create item
-    log('info', 'Creating Atlas Instant App from model template…');
-    const itemRes = await agolPost('/content/users/' + STATE.username + '/addItem', addItemPayload);
-    const appItemId = itemRes.id;
-    log('ok', '✓ Instant App created: ' + appItemId);
-
-    // Update with final URL containing the real appid
-    log('info', 'Updating URL with item ID…');
-    const finalData = buildAtlasData(appTitle, groupId, appItemId, modelData);
+    // ── Step 4: Update the cloned item with user inputs ──
+    log('info', 'Updating clone with your title, tags, and group…');
     await agolPost('/content/users/' + STATE.username + '/items/' + appItemId + '/update', {
-      url:   VIEWER_BASE + '?appid=' + appItemId,
-      text:  JSON.stringify(finalData),
-      token: STATE.token
+      title:       appTitle,
+      tags:        appTags,
+      snippet:     appTitle,
+      description: 'Schools Atlas — ' + appTitle,
+      url:         VIEWER_BASE + '?appid=' + appItemId,
+      text:        JSON.stringify(appData),
+      token:       STATE.token
     });
-    log('ok', '✓ Configuration saved.');
+    log('ok', '✓ Update applied to cloned app.');
 
-    // ── Verification: fetch back the new item and diff against model ──
-    // This identifies exactly what's missing or different, so we know
-    // whether the configurator will recognize the app.
-    log('info', 'Verifying new item matches model template…');
+    // ── Step 5: Verify the clone retained Instant App characteristics ──
+    log('info', 'Verifying clone integrity…');
     try {
       const newMeta = await agolFetch('/content/items/' + appItemId);
-
-      const COMPARE_FIELDS = ['type','typeKeywords','properties','url'];
-      let allMatch = true;
-      COMPARE_FIELDS.forEach(function(field){
-        const modelVal = JSON.stringify(modelMeta[field]);
-        const newVal   = JSON.stringify(newMeta[field]);
-        if(field === 'url'){
-          // URL is expected to differ in the appid
-          const modelHasAtlas = (modelMeta.url || '').indexOf('/atlas/') !== -1;
-          const newHasAtlas   = (newMeta.url   || '').indexOf('/atlas/') !== -1;
-          if(modelHasAtlas !== newHasAtlas){
-            log('warn', '  ⚠ url path mismatch — viewer path differs from model');
-            allMatch = false;
-          } else {
-            log('ok', '  ✓ url: viewer path matches model');
-          }
-        } else if(modelVal === newVal){
-          log('ok', '  ✓ ' + field + ': matches model');
-        } else {
-          allMatch = false;
-          log('warn', '  ⚠ ' + field + ' differs');
-          log('warn', '    model: ' + (modelVal || '(none)').substring(0, 120));
-          log('warn', '    new:   ' + (newVal   || '(none)').substring(0, 120));
-        }
-      });
-
-      if(allMatch){
-        log('ok', '✓ All critical fields match model. Configurator should open the app.');
+      const tk = (newMeta.typeKeywords || []).join(', ');
+      log('info', '  type: ' + newMeta.type);
+      log('info', '  typeKeywords: ' + tk);
+      if(tk.indexOf('Instant App') !== -1){
+        log('ok', '  ✓ Item is marked as Instant App — configurator should open it.');
       } else {
-        log('warn', '⚠ Some fields differ from model. Configurator may not recognize the app.');
+        log('warn', '  ⚠ "Instant App" not found in typeKeywords — configurator may not recognize this.');
       }
     } catch(verifyErr){
-      log('warn', '  Verification step failed: ' + verifyErr.message);
+      log('warn', '  Verification fetch failed: ' + verifyErr.message);
     }
 
     // Set private
